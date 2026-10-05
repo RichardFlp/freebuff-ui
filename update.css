@@ -27,5 +27,5 @@
  */
 
 html[data-fbts-update-probe] {
-  --fbts-remote-version: "1.3.4";
+  --fbts-remote-version: "1.4.0";
 }

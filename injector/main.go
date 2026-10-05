@@ -44,7 +44,7 @@ var engineJS []byte
 var communityJS []byte
 
 const (
-	version       = "1.3.4"
+	version       = "1.4.0"
 	markerStart   = "<!-- freebuff-theme-studio:start -->"
 	markerEnd     = "<!-- freebuff-theme-studio:end -->"
 	engineName    = "freebuff-theme-studio.js"
@@ -55,6 +55,11 @@ const (
 	cookieDangerBytes = 12000
 	backupSuffix      = ".freebuff-theme-original.bak"
 	manifestName      = ".freebuff-theme-studio.json"
+	// uninstallCookie is the panel's request to be removed. It carries the
+	// `fbts` prefix on purpose: profileCookieDBs only returns jars that hold
+	// something of ours, and the guard's clear pass deletes `fbts%` - so the
+	// request is both found and wiped by the same machinery as the theme.
+	uninstallCookie = "fbts_uninstall"
 )
 
 var (
@@ -421,9 +426,18 @@ func writeManifest(ui string, original []byte) error {
 	if _, err := os.Stat(filepath.Join(assetsDir(ui), defaultName)); err == nil {
 		baked = true
 	}
+	// InstalledAt is when Theme Studio first went into this install, and a
+	// re-inject deliberately does not refresh it: the panel's Delete button is
+	// only honoured while its request is newer than the injection it belongs to
+	// (see uninstallRequestPending), so a Freebuff update that puts the panel
+	// back must not quietly cancel a request the user just made.
+	installedAt := time.Now().UTC().Format(time.RFC3339)
+	if prev := readManifest(ui); prev != nil && prev.InstalledAt != "" {
+		installedAt = prev.InstalledAt
+	}
 	m := manifest{
 		Version:       version,
-		InstalledAt:   time.Now().UTC().Format(time.RFC3339),
+		InstalledAt:   installedAt,
 		OriginalSHA:   sha256Hex(original),
 		HadBackup:     hadBackup,
 		BakedThemeSet: baked,
@@ -464,6 +478,113 @@ func bakeTheme(ui, themeFile string) error {
 	}
 	body := "/* baked by FreebuffThemeInjector --theme */\nwindow.__FREEBUFF_THEME_DEFAULT__ = " + string(b) + ";\n"
 	return atomicWriteFile(filepath.Join(assetsDir(ui), defaultName), []byte(body), 0o644)
+}
+
+// ------------------------------------------------------------ remove it all ---
+
+// uninstallRequestPending reports whether the panel's Delete button has asked to
+// be removed, and returns the timestamp of that request.
+//
+// The panel cannot delete anything itself: it is a sandboxed renderer with no
+// filesystem access, which is why the Settings tab used to end by telling the
+// user to go and run --uninstall by hand. Instead it clears what it owns and
+// leaves this cookie, and the guard - an ordinary process - does the deleting.
+//
+// The value is epoch milliseconds, which is what the panel writes: digits need
+// no cookie escaping, so the value read here is the value written there.
+//
+// A request is honoured only while it is newer than the injection it belongs to.
+// The cookie is normally deleted by the removal itself, but that deletion is the
+// one step that can fail (it needs Freebuff closed and Bun present), and without
+// this check a request that outlived its install would undo the next install.
+func uninstallRequestPending(install string) (string, bool) {
+	m := readManifest(filepath.Join(install, "resources", "orchestrator", "ui"))
+	if m == nil {
+		// No manifest means no injection the guard owns; the next tick writes a
+		// fresh one, and any request is older than that by definition.
+		return "", false
+	}
+	bun := bunBinary(install)
+	if bun == "" {
+		return "", false
+	}
+	for _, db := range profileCookieDBs() {
+		// Cheap first: do not launch Bun for a jar whose bytes cannot hold it.
+		if b, err := os.ReadFile(db); err != nil || !bytes.Contains(b, []byte(uninstallCookie)) {
+			continue
+		}
+		rep, err := runCookieScript(bun, db, "report")
+		if err != nil || strings.TrimSpace(rep.Request) == "" {
+			continue
+		}
+		raw := strings.TrimSpace(rep.Request)
+		ms, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			// A damaged timestamp must not be able to trigger a removal, for the
+			// same reason: it would fire again on every future install.
+			return "", false
+		}
+		req := time.UnixMilli(ms)
+		if installed, err := time.Parse(time.RFC3339, m.InstalledAt); err == nil && !req.After(installed) {
+			return "", false
+		}
+		return raw, true
+	}
+	return "", false
+}
+
+// scheduleSelfRemoval deletes this executable's folder a moment after this
+// process exits. Windows will not delete a running image but will happily rename
+// one, which is why removeWatch() leaves at most one file behind - the guard's
+// own .exe - and why the leftover has to be cleaned up from outside. Nothing
+// happens unless this process is the installed guard: an installer the user
+// downloaded is their file, not ours to delete.
+func scheduleSelfRemoval() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return
+	}
+	dir := watchDir()
+	if dir == "" || !strings.EqualFold(filepath.Clean(filepath.Dir(self)), filepath.Clean(dir)) {
+		return
+	}
+	// ping is the sleep: unlike `timeout`, it needs no console and no redirect.
+	script := fmt.Sprintf(`ping -n 4 127.0.0.1 >nul & rmdir /s /q "%s" >nul 2>&1`, dir)
+	cmd := exec.Command("cmd.exe", "/c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: detachedFlag}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	_ = cmd.Process.Release()
+}
+
+// removeEverything takes Theme Studio back off the machine: the stored theme
+// first (which needs Freebuff closed, or Chromium writes the jar back), then the
+// injected files and the backup, then the guard itself. --uninstall runs it, and
+// it is what the guard runs when the Delete button in the Settings tab asks.
+// Returns false when any step failed, so --uninstall can still exit non-zero.
+func removeEverything(install, ui string, quiet bool) bool {
+	ok := true
+	if _, cleared := clearThemeCookies(install, quiet); !cleared {
+		ok = false
+		if !quiet {
+			warn("The stored theme could not be cleared - run --reset-theme after Freebuff is closed")
+		}
+	}
+	if err := uninstall(ui, quiet); err != nil {
+		ok = false
+		if !quiet {
+			warn("%v", err)
+		}
+	}
+	// Nothing may re-inject after a removal, so the guard goes last and takes
+	// its logon entry with it.
+	removeWatch()
+	scheduleSelfRemoval()
+	return ok
 }
 
 // --------------------------------------------------------------- uninstall ---
@@ -588,6 +709,8 @@ const cookieDBScript = `(async () => {
   const sql = "select count(*) as n, coalesce(sum(length(value)), 0) as b from cookies where name like 'fbts%'"
   const before = db.query(sql).get()
   const out = { cookies: before.n, bytes: before.b, action: process.env.FBTS_COOKIE_ACTION }
+  const req = db.query("select value from cookies where name = 'fbts_uninstall'").get()
+  out.request = req ? req.value : ''
   if (process.env.FBTS_COOKIE_ACTION === 'clear') {
     db.run("delete from cookies where name like 'fbts%'")
     out.remaining = db.query(sql).get().n
@@ -600,6 +723,8 @@ type cookieReport struct {
 	Bytes     int    `json:"bytes"`
 	Action    string `json:"action"`
 	Remaining int    `json:"remaining"`
+	// Request is the panel's removal request, empty when there is none.
+	Request string `json:"request"`
 }
 
 /*
@@ -1162,22 +1287,30 @@ func needsInjection(ui string) (bool, string) {
 	return false, ""
 }
 
-func watchTick() {
+// guardInstall is the install the guard is responsible for: it must never write
+// into a different copy of Freebuff than the one the user installed into. If
+// that path has stopped being a Freebuff install (reinstalled elsewhere), fall
+// back to detection so the panel still comes back.
+func guardInstall() string {
 	g := readGuard()
 	if g == nil {
-		return
+		return ""
 	}
-	// The install the guard was set up for first: it must never write into a
-	// different copy of Freebuff than the one the user installed into. If that
-	// path has stopped being a Freebuff install (reinstalled elsewhere), fall
-	// back to detection so the panel still comes back.
 	install := g.Install
 	if install == "" || !isInstallDir(install) {
 		found, err := findInstallDir("")
 		if err != nil {
-			return // no Freebuff to guard right now
+			return "" // no Freebuff to guard right now
 		}
 		install = found
+	}
+	return install
+}
+
+func watchTick() {
+	install := guardInstall()
+	if install == "" {
+		return
 	}
 	ui := filepath.Join(install, "resources", "orchestrator", "ui")
 	if readManifest(ui) == nil {
@@ -1217,6 +1350,21 @@ func runWatch() {
 		}
 	}()
 	for {
+		// The Delete button in the Settings tab cannot remove files - it is a
+		// sandboxed renderer - so it leaves a request and this process answers
+		// it. Checked first, so a user who asked to be removed is not re-injected
+		// on the way out. Freebuff has to close for this: Chromium holds the
+		// cookie jar in memory and would otherwise write the theme straight back.
+		if install := guardInstall(); install != "" {
+			if _, pending := uninstallRequestPending(install); pending {
+				watchLog("removing Theme Studio at the panel's request")
+				ui := filepath.Join(install, "resources", "orchestrator", "ui")
+				if !removeEverything(install, ui, true) {
+					watchLog("the requested removal finished with errors")
+				}
+				return
+			}
+		}
 		watchTick()
 		time.Sleep(watchInterval)
 		// Disarmed (--remove-watch) or superseded by a newer build: leave.
@@ -1247,6 +1395,7 @@ func main() {
 		fmt.Printf("Usage: %s [options]\n\n", filepath.Base(os.Args[0]))
 		fmt.Println("  Run with no options to install the theme panel into Freebuff Desktop.")
 		fmt.Println("  Then open Freebuff and click the palette icon in its sidebar rail.")
+		fmt.Println("  Its Settings tab has a Delete button that removes Theme Studio again.")
 		fmt.Println()
 		flag.PrintDefaults()
 		fmt.Println()
@@ -1315,18 +1464,13 @@ func main() {
 		if !quiet {
 			step("Removing Theme Studio")
 		}
-		// Clear and verify cookies before touching the installation. A failed
-		// cleanup must not be reported as a successful uninstall.
-		if _, ok := clearThemeCookies(install, quiet); !ok {
+		// The same removal the panel's Delete button performs, so the two cannot
+		// drift apart. A failed cookie cleanup is still reported as a failure -
+		// it must not read as a clean uninstall - but the injected files come out
+		// either way, because that is what the user asked for.
+		if !removeEverything(install, ui, quiet) {
 			os.Exit(1)
 		}
-		if err := uninstall(ui, quiet); err != nil {
-			warn("%v", err)
-			os.Exit(1)
-		}
-		// Nothing may re-inject after an uninstall: without this the guard
-		// would put the panel straight back on the next Freebuff update.
-		removeWatch()
 		fmt.Println()
 		ok("Freebuff is back to stock. Restart it if it is running.")
 		if *restartFlag {

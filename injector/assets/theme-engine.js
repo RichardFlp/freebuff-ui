@@ -16,7 +16,7 @@
 ;(function () {
   'use strict'
 
-  var VERSION = '1.3.4'
+  var VERSION = '1.4.0'
   if (window.__FREEBUFF_THEME_STUDIO__) return
   window.__FREEBUFF_THEME_STUDIO__ = VERSION
 
@@ -59,6 +59,14 @@
   var REMOTE_VERSION_VAR = '--fbts-remote-version'
   var SKIP_COOKIE = 'fbts_update_skip'
   var CHECK_COOKIE = 'fbts_update_check'
+  /* The Delete button's request to be removed. It carries the fbts prefix on
+   * purpose: the guard only opens a jar that holds something of ours, and its
+   * clear pass deletes fbts% - so the request is found and wiped by the same
+   * machinery as the theme. The value is the epoch-millisecond timestamp of the
+   * click, which is what tells a live request apart from one left over by an
+   * install that is already gone - and it is digits only, because a ':' would
+   * be stored percent-encoded. */
+  var UNINSTALL_COOKIE = 'fbts_uninstall'
   var CHECK_SEEN_COOKIE = 'fbts_update_seen'
   // Hourly, not six-hourly: the old interval plus a once-per-session check
   // meant a release could sit unnoticed for most of a day.
@@ -1696,6 +1704,10 @@
   // Optimistically attempt the write; unrelated app cookies do not prove that
   // this extension's own cookie can be stored.
   var cookiesUsable = true
+  /* Past the point of no return: the theme was cleared as part of the removal
+   * request, and a later save would put what the user just deleted back into
+   * the cookie jar. */
+  var removalRequested = false
   var storageNoticeShown = false
   var rawNoticeShown = false
 
@@ -1729,6 +1741,7 @@
   }
 
   function saveStateNow(s, force) {
+    if (removalRequested) return false
     if (!stateDirty && !force) return false
     if (saveTimer) {
       clearTimeout(saveTimer)
@@ -5076,16 +5089,12 @@
     }
 
     /**
-     * Everything this page is allowed to delete.
-     *
-     * The panel, its engine and its data file live in Freebuff's install
-     * folder, and a web page cannot delete files there - that is the browser
-     * sandbox doing its job, not an oversight. So the button below erases every
-     * trace this page wrote (theme cookies, the session cache, the page
-     * stylesheet and the raw CSS tag) and then says exactly how to remove the
-     * three files, which the installer does with --uninstall.
+     * Everything this page is allowed to delete, and nothing else: every style
+     * it has written into Freebuff, every cookie it has stored, and the session
+     * cache. It is the first half of the Delete button; the second half is a
+     * request the guard outside the page carries out.
      */
-    function deleteThemeStudioData() {
+    function clearPageSideData() {
       var name
       for (name in applied.colors) unsetVar(name)
       for (name in applied.layout) unsetVar(name)
@@ -5111,45 +5120,103 @@
       rebuild()
       refreshKnobs()
       renderSettings()
-      showDeleteDone(cookies)
       return cookies
+    }
+
+    /**
+     * Ask the guard to take Theme Studio off the machine.
+     *
+     * A web page cannot delete files in Freebuff's install folder, and it
+     * cannot end the guard's process either - that is the browser sandbox doing
+     * its job. What it can do is leave a request in the one store it owns, and
+     * the guard reads that out of the cookie jar on its next pass: it clears the
+     * stored theme, removes the injected scripts, the engine and the community
+     * file, puts index.html back, and then takes itself away.
+     *
+     * Freebuff closes as part of that, because Chromium holds the cookie jar in
+     * memory and would otherwise write the theme straight back after it was
+     * deleted. The confirm step says so before anything happens.
+     */
+    function requestRemoval() {
+      if (removalRequested) return true
+      var cookies = clearPageSideData()
+      // Written after the wipe above, which erases every fbts cookie - the
+      // request among them. The value is epoch milliseconds rather than an ISO
+      // string on purpose: a ':' in a cookie value is stored percent-encoded,
+      // and the guard would then be parsing "%3A" out of the jar. Digits need
+      // no escaping, so what the guard reads is what was written here.
+      var written = false
+      try {
+        written = writeCookie(UNINSTALL_COOKIE, String(Date.now()), 1)
+      } catch (e) {
+        written = false
+      }
+      if (written) removalRequested = true
+      showRemoveProgress(cookies, written)
+      return written
+    }
+
+    /** Offer the theme as a file before it is deleted. Exporting is one click
+     *  in the Export tab, but nobody finds it while staring at a delete prompt. */
+    function saveThemeCopy() {
+      try {
+        download(JSON.stringify(themeDocument(state), null, 2), themeFileName(state.name))
+        showToast('Saved ' + themeFileName(state.name))
+      } catch (e) {
+        showToast('Could not save the theme file')
+      }
     }
 
     function showDeleteConfirm() {
       modalBody.textContent = ''
       modalBody.appendChild(el('h3', { text: 'Delete Theme Studio?' }))
       modalBody.appendChild(
-        el('p', { text: 'This deletes your stored theme, the automatic-update settings, the session cache and every style this page has written into Freebuff. It cannot be undone, so save a .fbtheme first if you want to keep the theme.' }),
+        el('p', { text: 'This deletes your stored theme, the automatic-update settings, the session cache and every style this page has written into Freebuff - and then removes the panel itself: the injected scripts and the engine come out of the install folder, and Freebuff\u2019s own index.html is put back. It cannot be undone, so save a .fbtheme first if you want to keep the theme.' }),
       )
       modalBody.appendChild(
-        el('p', { text: 'The panel itself is three files inside the Freebuff install folder. A web page is not allowed to delete those - that is the browser sandbox, and no theme editor can get around it - so finishing the job takes one run of the installer with --uninstall, which the next step explains.' }),
+        el('p', { text: 'Freebuff closes to finish the job and opens again as stock Freebuff, so save anything else you are working on before going ahead.' }),
       )
       modalBody.appendChild(
         el('div', { class: 'fbts-modal-foot' }, [
           el('button', {
-            class: 'fbts-btn danger', type: 'button', text: 'Delete my theme and settings',
+            class: 'fbts-btn danger', type: 'button', text: 'Delete everything',
             onclick: function () {
               closePopup()
-              deleteThemeStudioData()
+              requestRemoval()
             },
           }),
+          el('button', { class: 'fbts-btn', type: 'button', text: 'Save a copy first', onclick: saveThemeCopy }),
           el('button', { class: 'fbts-btn', type: 'button', text: 'Cancel', onclick: function () { closePopup() } }),
         ]),
       )
       modalWrap.classList.add('show')
     }
 
-    function showDeleteDone(cookieCount) {
+    /** What the request produced. A page cannot watch its own removal - the
+     *  guard has to close Freebuff to clear the cookie jar - so this says what
+     *  was done from here, what happens next, and how to finish it by hand if
+     *  no guard is running. */
+    function showRemoveProgress(cookieCount, requested) {
       modalBody.textContent = ''
-      modalBody.appendChild(el('h3', { text: 'Theme deleted' }))
+      if (!requested) {
+        modalBody.appendChild(el('h3', { text: 'Could not leave the request' }))
+        modalBody.appendChild(
+          el('p', {
+            text: 'Your theme, its settings and every style this page wrote are gone, but the panel could not ask the guard to remove itself: cookies are blocked, and a cookie is the only place the guard can read the request from. Run the installer once more with --uninstall to finish.',
+          }),
+        )
+      } else {
+        modalBody.appendChild(el('h3', { text: 'Removing Theme Studio' }))
+        modalBody.appendChild(
+          el('p', {}, [
+            'Deleted ' + cookieCount + ' theme cookies, the session cache and every style this page had written. ',
+            'The background guard does the rest on its next pass - within about 15 seconds. It clears the stored theme, removes the injected scripts, the engine and the community file, and puts Freebuff\u2019s own index.html back. ',
+            'Freebuff closes while that happens, and opens again as stock Freebuff.',
+          ]),
+        )
+      }
       modalBody.appendChild(
-        el('p', {}, [
-          'Removed ' + cookieCount + ' theme cookies, the session cache and every style this page had written. ',
-          'Freebuff is back to its own colours as soon as this page is reloaded.',
-        ]),
-      )
-      modalBody.appendChild(
-        el('p', { text: 'To remove the panel as well, run the installer you downloaded once more with --uninstall. It takes the panel, the engine and the community file out of the install folder and puts Freebuff\u2019s own index.html back.' }),
+        el('p', { text: 'If nothing happens within a minute the guard is not running - the installer\u2019s --uninstall does exactly the same removal from outside.' }),
       )
       var command = el('code', { class: 'fbts-code', text: 'FreebuffThemeInjector.exe --uninstall' })
       modalBody.appendChild(el('p', {}, [command]))
@@ -5224,7 +5291,7 @@
 
     settingsPane.appendChild(
       settingsGroup('Delete', [
-        el('div', { class: 'fbts-note', style: 'color:var(--fbts-danger);margin:0 0 8px', text: 'Deleting removes your theme, the saved settings and every style this page wrote into Freebuff. The three files in the install folder are removed by the installer, because a web page cannot delete files.' }),
+        el('div', { class: 'fbts-note', style: 'color:var(--fbts-danger);margin:0 0 8px', text: 'Deleting removes your theme, the saved settings and every style this page wrote into Freebuff - then the panel, the engine and the community file from the install folder, with Freebuff\u2019s own index.html put back. A page cannot delete files, so the background guard does that part, and Freebuff closes to finish.' }),
         el('div', { class: 'fbts-actions', style: 'border:none;background:none;padding:0' }, [
           el('button', { class: 'fbts-btn danger', type: 'button', text: 'Delete Theme Studio', onclick: showDeleteConfirm }),
         ]),

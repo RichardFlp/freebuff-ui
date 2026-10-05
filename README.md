@@ -316,11 +316,17 @@ Everything that is about the editor rather than the colours:
   the last check ran, and forget a version you chose to skip.
 - **Storage** - how much of the stored-theme budget is in use, a **Save now** button, and a
   way to drop the same-session cache.
-- **Delete** - **Delete Theme Studio** erases your theme, every saved setting and every
-  style the page wrote into Freebuff, after a confirmation. It cannot delete the panel's
-  own files, because a web page is not allowed to delete files from the install folder;
-  it tells you the one command that finishes the job (`FreebuffThemeInjector.exe
-  --uninstall`) and can copy it for you.
+- **Delete** - **Delete Theme Studio** removes the whole thing, after a confirmation: your
+  theme, every saved setting and every style the page wrote into Freebuff, and then the
+  panel, the engine and the community file from the install folder, with Freebuff's own
+  `index.html` put back.
+
+  A page is not allowed to delete files, so the button does the half it can and asks the
+  background guard to do the rest, which takes one pass - about fifteen seconds. Freebuff
+  closes while that happens, because Chromium keeps the cookie jar in memory and would
+  otherwise write the deleted theme straight back; it opens again as stock Freebuff. If no
+  guard is running, the same removal is one command, and the dialog can copy it for you:
+  `FreebuffThemeInjector.exe --uninstall`.
 
 ---
 
@@ -385,10 +391,15 @@ click **Choose a file** and pick a `.fbtheme` file, or drop the file on the page
 
 ## Removing it
 
-Run `FreebuffThemeInjector.exe --uninstall`. This removes the palette icon, deletes the
-editor, and puts the original file back exactly as it was. Freebuff returns to normal.
+The **Settings** tab has a **Delete Theme Studio** button that removes it from inside
+Freebuff: confirm once, and the background guard clears the stored theme, deletes the
+editor, restores the original file and then removes itself - its files and its logon
+entry. Freebuff closes to finish the job and opens again as stock Freebuff.
 
-The stored theme is deleted with it, so nothing is left behind in Freebuff's cookie jar.
+From a terminal, `FreebuffThemeInjector.exe --uninstall` runs exactly the same removal and
+is what to use if the guard is not running. Either way the palette icon goes, the editor
+and the community file are deleted, the original file is put back exactly as it was, and
+the stored theme is cleared out of Freebuff's cookie jar, so nothing is left behind.
 
 ---
 
