@@ -44,7 +44,7 @@ var engineJS []byte
 var communityJS []byte
 
 const (
-	version       = "1.4.0"
+	version       = "1.4.1"
 	markerStart   = "<!-- freebuff-theme-studio:start -->"
 	markerEnd     = "<!-- freebuff-theme-studio:end -->"
 	engineName    = "freebuff-theme-studio.js"
@@ -539,19 +539,19 @@ func uninstallRequestPending(install string) (string, bool) {
 // own .exe - and why the leftover has to be cleaned up from outside. Nothing
 // happens unless this process is the installed guard: an installer the user
 // downloaded is their file, not ours to delete.
-func scheduleSelfRemoval() {
+// scheduleDirRemoval arranges for the guard's folder to be taken away from
+// outside, a moment from now. A process cannot delete its own image, and
+// os.RemoveAll gives up at the first locked file, so anything still in there
+// has to be waited out by something else. ping is the sleep: unlike `timeout`,
+// it needs no console and no redirect.
+func scheduleDirRemoval() {
 	if runtime.GOOS != "windows" {
 		return
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return
-	}
 	dir := watchDir()
-	if dir == "" || !strings.EqualFold(filepath.Clean(filepath.Dir(self)), filepath.Clean(dir)) {
+	if dir == "" {
 		return
 	}
-	// ping is the sleep: unlike `timeout`, it needs no console and no redirect.
 	script := fmt.Sprintf(`ping -n 4 127.0.0.1 >nul & rmdir /s /q "%s" >nul 2>&1`, dir)
 	cmd := exec.Command("cmd.exe", "/c", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: detachedFlag}
@@ -561,12 +561,31 @@ func scheduleSelfRemoval() {
 	_ = cmd.Process.Release()
 }
 
+// scheduleSelfRemoval is scheduleDirRemoval for the case where this process IS
+// the installed guard. An installer the user downloaded is their file, and is
+// left exactly where it is.
+func scheduleSelfRemoval() {
+	if selfImage == "" {
+		return
+	}
+	dir := watchDir()
+	if dir == "" || !strings.EqualFold(filepath.Clean(filepath.Dir(selfImage)), filepath.Clean(dir)) {
+		return
+	}
+	scheduleDirRemoval()
+}
+
 // removeEverything takes Theme Studio back off the machine: the stored theme
 // first (which needs Freebuff closed, or Chromium writes the jar back), then the
 // injected files and the backup, then the guard itself. --uninstall runs it, and
 // it is what the guard runs when the Delete button in the Settings tab asks.
 // Returns false when any step failed, so --uninstall can still exit non-zero.
 func removeEverything(install, ui string, quiet bool) bool {
+	// Scheduled before anything else touches this image. removeWatch() renames a
+	// running guard rather than deleting it (Windows allows a rename where it
+	// refuses a delete), and once that has happened there is no way left to ask
+	// where we are: os.Executable() has nothing to report.
+	scheduleSelfRemoval()
 	ok := true
 	if _, cleared := clearThemeCookies(install, quiet); !cleared {
 		ok = false
@@ -583,7 +602,6 @@ func removeEverything(install, ui string, quiet bool) bool {
 	// Nothing may re-inject after a removal, so the guard goes last and takes
 	// its logon entry with it.
 	removeWatch()
-	scheduleSelfRemoval()
 	return ok
 }
 
@@ -853,7 +871,24 @@ func stopFreebuff(quiet bool) bool {
 	cmd := exec.Command("taskkill", "/IM", "Freebuff.exe")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	_ = cmd.Run()
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 20; i++ {
+		if !freebuffRunning() {
+			return true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	// A window that will not close is not a reason to abandon the removal - but
+	// it is a reason the stored theme would come straight back, because Chromium
+	// writes the cookie jar on its way out. So ask harder. This is reached by
+	// --reset-theme and --uninstall too, where the whole point of stopping the
+	// app is that its in-memory copy of the jar must not outlive the deletion.
+	if !quiet {
+		info("Freebuff did not close on its own - closing it forcefully\u2026")
+	}
+	force := exec.Command("taskkill", "/F", "/IM", "Freebuff.exe")
+	force.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = force.Run()
+	for i := 0; i < 40; i++ {
 		if !freebuffRunning() {
 			return true
 		}
@@ -1011,6 +1046,10 @@ const (
 	watchSettle  = 1500 * time.Millisecond
 	detachedFlag = 0x00000008 // DETACHED_PROCESS: start without a console
 )
+
+// selfImage is this process's own executable path, resolved once at startup -
+// see scheduleSelfRemoval for why it cannot be asked for later.
+var selfImage string
 
 func watchDir() string {
 	base := os.Getenv("LOCALAPPDATA")
@@ -1255,9 +1294,14 @@ func removeWatch() {
 			_ = os.Rename(f, f+".old")
 		}
 	}
-	// The folder belongs to this guard and nothing else. Failing to remove a
-	// still-running image is expected and harmless; the logon entry is gone.
+	// The folder belongs to this guard and nothing else.
 	_ = os.RemoveAll(watchDir())
+	if _, err := os.Stat(watchDir()); err == nil {
+		// Something in there is still locked - a guard image that is only now
+		// exiting, usually, or this one. RemoveAll stops at the first such file,
+		// so the rest is left to a detached rmdir once we are gone.
+		scheduleDirRemoval()
+	}
 }
 
 // needsInjection says whether index.html should be written again, and why.
@@ -1359,8 +1403,17 @@ func runWatch() {
 			if _, pending := uninstallRequestPending(install); pending {
 				watchLog("removing Theme Studio at the panel's request")
 				ui := filepath.Join(install, "resources", "orchestrator", "ui")
+				wasRunning := freebuffRunning()
 				if !removeEverything(install, ui, true) {
 					watchLog("the requested removal finished with errors")
+				}
+				// The app had to be closed to clear the stored theme, and the page it
+				// had loaded is still carrying the panel in memory - which is where
+				// the palette icon comes from. Start it again, so the removal is
+				// something the user can see rather than a window that vanished and
+				// a plugin that still looks installed.
+				if wasRunning {
+					relaunch(install)
 				}
 				return
 			}
@@ -1376,6 +1429,9 @@ func runWatch() {
 
 func main() {
 	initColors()
+	if self, err := os.Executable(); err == nil {
+		selfImage = self
+	}
 
 	var (
 		pathFlag        = flag.String("path", "", "Freebuff install directory (auto-detected by default)")

@@ -16,7 +16,7 @@
 ;(function () {
   'use strict'
 
-  var VERSION = '1.4.0'
+  var VERSION = '1.4.1'
   if (window.__FREEBUFF_THEME_STUDIO__) return
   window.__FREEBUFF_THEME_STUDIO__ = VERSION
 
@@ -2386,7 +2386,28 @@
    * elements. Injecting one there means the shell styles it for us - we only
    * supply the icon and the handler.
    */
+  /**
+   * Take this panel's own icon out of Freebuff's rail, and leave it out.
+   *
+   * The removal is asked for from inside this page, and this page goes on
+   * running until Freebuff is next loaded - so without this the rail still
+   * shows the palette icon after "deleted", which reads as "not deleted". Any
+   * node left in the DOM is swept up too, not just the one held here: the shell
+   * can re-render the rail underneath us.
+   */
+  function removeRailButton() {
+    var nodes = document.querySelectorAll('[data-fbts-rail]')
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i])
+    }
+    railButton = null
+  }
+
   function installRailButton() {
+    if (removalRequested) {
+      removeRailButton()
+      return false
+    }
     if (railButton && railButton.isConnected) return true
     var rail =
       document.querySelector('.shell-navigation-top') ||
@@ -5151,7 +5172,12 @@
       } catch (e) {
         written = false
       }
-      if (written) removalRequested = true
+      if (written) {
+        removalRequested = true
+        // The icon goes with the request, not with the files: the page that
+        // drew it is the page the request came from.
+        removeRailButton()
+      }
       showRemoveProgress(cookies, written)
       return written
     }

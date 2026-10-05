@@ -322,10 +322,12 @@ Everything that is about the editor rather than the colours:
   `index.html` put back.
 
   A page is not allowed to delete files, so the button does the half it can and asks the
-  background guard to do the rest, which takes one pass - about fifteen seconds. Freebuff
-  closes while that happens, because Chromium keeps the cookie jar in memory and would
-  otherwise write the deleted theme straight back; it opens again as stock Freebuff. If no
-  guard is running, the same removal is one command, and the dialog can copy it for you:
+  background guard to do the rest, which takes one pass - about fifteen seconds. The
+  palette icon leaves the rail the moment you confirm, because the page drawing it is the
+  page asking to be removed. Freebuff closes while the rest happens - Chromium keeps the
+  cookie jar in memory and would otherwise write the deleted theme straight back - and the
+  guard starts it again, so you come back to stock Freebuff. If no guard is running, the
+  same removal is one command, and the dialog can copy it for you:
   `FreebuffThemeInjector.exe --uninstall`.
 
 ---
